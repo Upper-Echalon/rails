@@ -30,6 +30,20 @@ module ActiveSupport
     end
 
     module Encoding # :nodoc:
+      U2028 = -"\u2028".b
+      U2029 = -"\u2029".b
+
+      ESCAPED_CHARS = {
+        U2028 => '\u2028'.b,
+        U2029 => '\u2029'.b,
+        ">".b => '\u003e'.b,
+        "<".b => '\u003c'.b,
+        "&".b => '\u0026'.b,
+      }
+
+      ESCAPE_REGEX_WITH_HTML_ENTITIES = Regexp.union(*ESCAPED_CHARS.keys)
+      ESCAPE_REGEX_WITHOUT_HTML_ENTITIES = Regexp.union(U2028, U2029)
+
       class JSONGemEncoder # :nodoc:
         attr_reader :options
 
@@ -47,14 +61,13 @@ module ActiveSupport
           # Rails does more escaping than the JSON gem natively does (we
           # escape \u2028 and \u2029 and optionally >, <, & to work around
           # certain browser problems).
+          json.force_encoding(::Encoding::BINARY)
           if @options.fetch(:escape_html_entities, Encoding.escape_html_entities_in_json)
-            json.gsub!(">", '\u003e')
-            json.gsub!("<", '\u003c')
-            json.gsub!("&", '\u0026')
+            json.gsub!(ESCAPE_REGEX_WITH_HTML_ENTITIES, ESCAPED_CHARS)
+          else
+            json.gsub!(ESCAPE_REGEX_WITHOUT_HTML_ENTITIES, ESCAPED_CHARS)
           end
-          json.gsub!("\u2028", '\u2028')
-          json.gsub!("\u2029", '\u2029')
-          json
+          json.force_encoding(::Encoding::UTF_8)
         end
 
         private
@@ -87,7 +100,11 @@ module ActiveSupport
             when Array
               value.map { |v| jsonify(v) }
             else
-              jsonify value.as_json
+              if defined?(::JSON::Fragment) && ::JSON::Fragment === value
+                value
+              else
+                jsonify value.as_json
+              end
             end
           end
 
@@ -95,6 +112,50 @@ module ActiveSupport
           def stringify(jsonified)
             ::JSON.generate(jsonified)
           end
+      end
+
+      if defined?(::JSON::Coder)
+        class JSONGemCoderEncoder # :nodoc:
+          JSON_NATIVE_TYPES = [Hash, Array, Float, String, Symbol, Integer, NilClass, TrueClass, FalseClass, ::JSON::Fragment].freeze
+          CODER = ::JSON::Coder.new do |value|
+            json_value = value.as_json
+            # Handle objects returning self from as_json
+            if json_value.equal?(value)
+              next ::JSON::Fragment.new(::JSON.generate(json_value))
+            end
+            # Handle objects not returning JSON-native types from as_json
+            count = 5
+            until JSON_NATIVE_TYPES.include?(json_value.class)
+              raise SystemStackError if count == 0
+              json_value = json_value.as_json
+              count -= 1
+            end
+            json_value
+          end
+
+
+          def initialize(options = nil)
+            @options = options ? options.dup.freeze : {}.freeze
+          end
+
+          # Encode the given object into a JSON string
+          def encode(value)
+            value = value.as_json(@options) unless @options.empty?
+
+            json = CODER.dump(value)
+
+            # Rails does more escaping than the JSON gem natively does (we
+            # escape \u2028 and \u2029 and optionally >, <, & to work around
+            # certain browser problems).
+            json.force_encoding(::Encoding::BINARY)
+            if @options.fetch(:escape_html_entities, Encoding.escape_html_entities_in_json)
+              json.gsub!(ESCAPE_REGEX_WITH_HTML_ENTITIES, ESCAPED_CHARS)
+            else
+              json.gsub!(ESCAPE_REGEX_WITHOUT_HTML_ENTITIES, ESCAPED_CHARS)
+            end
+            json.force_encoding(::Encoding::UTF_8)
+          end
+        end
       end
 
       class << self
@@ -126,7 +187,12 @@ module ActiveSupport
 
       self.use_standard_json_time_format = true
       self.escape_html_entities_in_json  = true
-      self.json_encoder = JSONGemEncoder
+      self.json_encoder =
+        if defined?(::JSON::Coder)
+          JSONGemCoderEncoder
+        else
+          JSONGemEncoder
+        end
       self.time_precision = 3
     end
   end
